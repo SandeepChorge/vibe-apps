@@ -1,0 +1,235 @@
+# Builds Rock Master RC Android APKs.
+#
+# Path filters apply to branch pushes only. GitHub does not evaluate path
+# filters for tag pushes, so tags are limited to rock-master-rc-v* and this
+# workflow does not run for other apps' tags. Branch pushes run only when
+# apps/rock-master-rc/** or this file changes.
+
+name: Rock Master RC APK
+
+on:
+  workflow_dispatch:
+    inputs:
+      build_type:
+        description: Build type
+        required: true
+        type: choice
+        default: release
+        options:
+          - release
+          - debug
+      create_release:
+        description: Also create a GitHub Release with the APKs attached
+        required: true
+        type: boolean
+        default: false
+  push:
+    branches:
+      - main
+    tags:
+      - "rock-master-rc-v*"
+    paths:
+      - "apps/rock-master-rc/**"
+      - ".github/workflows/rock-master-rc-apk.yml"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: rock-master-rc-apk-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  apk:
+    name: Build APK
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    defaults:
+      run:
+        working-directory: apps/rock-master-rc
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+          cache: gradle
+          cache-dependency-path: |
+            apps/rock-master-rc/android/**/*.gradle*
+            apps/rock-master-rc/android/**/*.kts
+            apps/rock-master-rc/android/gradle/wrapper/gradle-wrapper.properties
+
+      - name: Set up Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          flutter-version: "3.50.0"
+          cache: true
+          pub-cache: true
+
+      - name: Read app version
+        id: version
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="$(awk '/^version:/ { print $2; exit }' pubspec.yaml)"
+          if [ -z "$version" ]; then
+            echo "version: is missing from pubspec.yaml" >&2
+            exit 1
+          fi
+          slug="$(printf '%s' "$version" | tr '+' '-')"
+          {
+            echo "version=$version"
+            echo "slug=$slug"
+            echo "tag=rock-master-rc-v$version"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Resolve build type
+        id: build_type
+        shell: bash
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          INPUT_BUILD_TYPE: ${{ github.event.inputs.build_type }}
+        run: |
+          set -euo pipefail
+          if [ "$EVENT_NAME" = "workflow_dispatch" ]; then
+            build_type="$INPUT_BUILD_TYPE"
+          else
+            build_type="release"
+          fi
+          case "$build_type" in
+            release|debug) ;;
+            *)
+              echo "Unsupported build type: $build_type" >&2
+              exit 1
+              ;;
+          esac
+          echo "type=$build_type" >> "$GITHUB_OUTPUT"
+
+      - name: Install dependencies
+        run: flutter pub get
+
+      - name: Analyze
+        run: flutter analyze
+
+      - name: Test
+        run: flutter test
+
+      - name: Configure Android signing
+        id: signing
+        shell: bash
+        env:
+          BUILD_TYPE: ${{ steps.build_type.outputs.type }}
+          ANDROID_KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+        run: |
+          set -euo pipefail
+          summary="Debug keystore. Release signing secrets are not set, so the APK is debug-signed."
+          if [ "$BUILD_TYPE" = "debug" ]; then
+            summary="Debug build, signed with the Android debug keystore."
+          elif [ -n "${ANDROID_KEYSTORE_BASE64}" ] || [ -n "${ANDROID_KEYSTORE_PASSWORD}" ] || [ -n "${ANDROID_KEY_ALIAS}" ] || [ -n "${ANDROID_KEY_PASSWORD}" ]; then
+            if [ -z "${ANDROID_KEYSTORE_BASE64}" ] || [ -z "${ANDROID_KEYSTORE_PASSWORD}" ] || [ -z "${ANDROID_KEY_ALIAS}" ] || [ -z "${ANDROID_KEY_PASSWORD}" ]; then
+              echo "Set all of ANDROID_KEYSTORE_BASE64, ANDROID_KEYSTORE_PASSWORD, ANDROID_KEY_ALIAS, and ANDROID_KEY_PASSWORD, or none of them." >&2
+              exit 1
+            fi
+            keystore_path="$RUNNER_TEMP/rock-master-rc-upload.keystore"
+            printf '%s' "$ANDROID_KEYSTORE_BASE64" | tr -d '[:space:]' | base64 -d > "$keystore_path"
+            if [ ! -s "$keystore_path" ]; then
+              echo "Decoded keystore is empty." >&2
+              exit 1
+            fi
+            {
+              echo "ANDROID_KEYSTORE_PATH=$keystore_path"
+              echo "ANDROID_KEYSTORE_PASSWORD<<EOF"
+              echo "$ANDROID_KEYSTORE_PASSWORD"
+              echo "EOF"
+              echo "ANDROID_KEY_ALIAS<<EOF"
+              echo "$ANDROID_KEY_ALIAS"
+              echo "EOF"
+              echo "ANDROID_KEY_PASSWORD<<EOF"
+              echo "$ANDROID_KEY_PASSWORD"
+              echo "EOF"
+            } >> "$GITHUB_ENV"
+            summary="Release keystore from repository secrets."
+          fi
+          echo "summary=$summary" >> "$GITHUB_OUTPUT"
+          echo "$summary" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Build universal and split APKs
+        shell: bash
+        env:
+          BUILD_TYPE: ${{ steps.build_type.outputs.type }}
+          VERSION_SLUG: ${{ steps.version.outputs.slug }}
+        run: |
+          set -euo pipefail
+          saved="$RUNNER_TEMP/apk-saved"
+          mkdir -p dist "$saved"
+          rm -f dist/*.apk
+          flutter build apk --"$BUILD_TYPE"
+          shopt -s nullglob
+          for apk in build/app/outputs/flutter-apk/*.apk; do
+            cp "$apk" "$saved/"
+          done
+          flutter build apk --"$BUILD_TYPE" --split-per-abi
+          for apk in build/app/outputs/flutter-apk/*.apk "$saved"/*.apk; do
+            [ -f "$apk" ] || continue
+            base="$(basename "$apk")"
+            suffix="${base#app-}"
+            cp "$apk" "dist/rock-master-rc-${VERSION_SLUG}-${suffix}"
+          done
+          shopt -u nullglob
+          if ! compgen -G "dist/*.apk" > /dev/null; then
+            echo "No APKs were produced." >&2
+            exit 1
+          fi
+          ls -lh dist
+
+      - name: Summarize APKs
+        shell: bash
+        env:
+          BUILD_TYPE: ${{ steps.build_type.outputs.type }}
+          VERSION: ${{ steps.version.outputs.version }}
+          SIGNING_SUMMARY: ${{ steps.signing.outputs.summary }}
+        run: |
+          set -euo pipefail
+          {
+            echo "## Rock Master RC ${VERSION}"
+            echo ""
+            echo "- Build type: \`${BUILD_TYPE}\`"
+            echo "- Signing: ${SIGNING_SUMMARY}"
+            echo ""
+            echo "| APK | Size |"
+            echo "| --- | ---: |"
+            shopt -s nullglob
+            for apk in dist/*.apk; do
+              bytes="$(stat -c%s "$apk")"
+              human="$(numfmt --to=iec-i --suffix=B "$bytes")"
+              echo "| \`$(basename "$apk")\` | ${human} (${bytes} bytes) |"
+            done
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload APKs
+        uses: actions/upload-artifact@v4
+        with:
+          name: rock-master-rc-${{ steps.version.outputs.slug }}-${{ steps.build_type.outputs.type }}
+          path: apps/rock-master-rc/dist/*.apk
+          if-no-files-found: error
+
+      - name: Create GitHub Release
+        if: github.ref_type == 'tag' || (github.event_name == 'workflow_dispatch' && github.event.inputs.create_release == 'true')
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_type == 'tag' && github.ref_name || steps.version.outputs.tag }}
+          name: Rock Master RC ${{ steps.version.outputs.version }} (${{ steps.build_type.outputs.type }})
+          body: |
+            Android APKs for Rock Master RC `${{ steps.version.outputs.version }}` (${{ steps.build_type.outputs.type }}).
+
+            Signing: ${{ steps.signing.outputs.summary }}
+          files: apps/rock-master-rc/dist/*.apk
+          fail_on_unmatched_files: true
+          generate_release_notes: true
