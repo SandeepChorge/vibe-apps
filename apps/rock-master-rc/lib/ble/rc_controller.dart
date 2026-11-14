@@ -6,20 +6,12 @@ import 'package:flutter/widgets.dart';
 import 'package:flutter_blue_plus/flutter_blue_plus.dart';
 import 'package:permission_handler/permission_handler.dart';
 
+import 'android_system.dart';
 import 'inspector.dart';
 import 'protocol.dart';
+import 'scan_list.dart';
 
-const String kSuggestedDeviceName = 'YC_CAR_DEMO';
-
-class ScanEntry {
-  ScanEntry({required this.device, required this.rssi, required this.name});
-
-  final BluetoothDevice device;
-  final int rssi;
-  final String name;
-
-  bool get isSuggested => name == kSuggestedDeviceName;
-}
+export 'scan_list.dart';
 
 class RcController extends ChangeNotifier with WidgetsBindingObserver {
   /// Drive frames are written on this period. Inspector reads and extra
@@ -51,16 +43,35 @@ class RcController extends ChangeNotifier with WidgetsBindingObserver {
   String? statusMessage;
   String? errorMessage;
 
-  final Map<DeviceIdentifier, ScanEntry> _results =
+  /// Android SDK, when this is an Android device. Null elsewhere.
+  int? androidSdkInt;
+
+  /// System Location services. Only consulted for the scan banner on API <= 30.
+  bool locationServicesEnabled = true;
+
+  bool get showLocationBanner => showAndroidLocationBanner(
+    sdkInt: androidSdkInt,
+    locationServicesEnabled: locationServicesEnabled,
+  );
+
+  bool get showBluetoothOffBanner => adapterState == BluetoothAdapterState.off;
+
+  final Map<DeviceIdentifier, ScanEntry> _scanResults =
       <DeviceIdentifier, ScanEntry>{};
-  List<ScanEntry> get devices {
-    final List<ScanEntry> list = _results.values.toList();
-    list.sort((ScanEntry a, ScanEntry b) {
-      if (a.isSuggested != b.isSuggested) return a.isSuggested ? -1 : 1;
-      return b.rssi.compareTo(a.rssi);
-    });
-    return list;
-  }
+  final Map<DeviceIdentifier, ScanEntry> _knownDevices =
+      <DeviceIdentifier, ScanEntry>{};
+
+  List<ScanEntry> get devices => mergeScanEntries(
+    systemConnected: _knownDevices.values
+        .where((ScanEntry entry) => entry.systemConnected)
+        .toList(),
+    bonded: _knownDevices.values
+        .where((ScanEntry entry) => entry.paired)
+        .toList(),
+    scanned: _scanResults.values.toList(),
+  );
+
+  static final Guid _carServiceGuid = Guid('fff0');
 
   BluetoothDevice? device;
   String deviceName = '';
@@ -165,9 +176,40 @@ class RcController extends ChangeNotifier with WidgetsBindingObserver {
     }
   }
 
+  /// Location-services banner and already-paired devices. Called on resume
+  /// and at the start of every scan.
+  Future<void> refreshScanEnvironment() async {
+    if (_preview || kIsWeb || !Platform.isAndroid) {
+      androidSdkInt = null;
+      locationServicesEnabled = true;
+      notifyListeners();
+      return;
+    }
+    androidSdkInt = await AndroidSystem.sdkInt();
+    if (androidSdkInt == null || androidSdkInt! > 30) {
+      locationServicesEnabled = true;
+      notifyListeners();
+      return;
+    }
+    try {
+      final ServiceStatus status = await Permission.location.serviceStatus;
+      locationServicesEnabled = status != ServiceStatus.disabled;
+    } catch (_) {
+      locationServicesEnabled = true;
+    }
+    notifyListeners();
+  }
+
+  Future<void> openLocationSettings() => openLocationSettingsOrAppSettings();
+
   Future<void> startScan() async {
     errorMessage = null;
-    if (!await requestPermissions()) return;
+    await refreshScanEnvironment();
+    if (!await requestPermissions()) {
+      await _loadKnownDevices();
+      return;
+    }
+    await _loadKnownDevices();
 
     if (adapterState == BluetoothAdapterState.off) {
       try {
@@ -188,7 +230,7 @@ class RcController extends ChangeNotifier with WidgetsBindingObserver {
     }
 
     await _scanSub?.cancel();
-    _results.clear();
+    _scanResults.clear();
     scanning = true;
     statusMessage = 'Scanning for cars…';
     notifyListeners();
@@ -198,10 +240,13 @@ class RcController extends ChangeNotifier with WidgetsBindingObserver {
         for (final ScanResult r in results) {
           final String name = _deviceName(r.device, r.advertisementData);
           if (name.isEmpty) continue;
-          _results[r.device.remoteId] = ScanEntry(
+          final ScanEntry? known = _knownDevices[r.device.remoteId];
+          _scanResults[r.device.remoteId] = ScanEntry(
             device: r.device,
             rssi: r.rssi,
             name: name,
+            paired: known?.paired ?? false,
+            systemConnected: known?.systemConnected ?? false,
           );
         }
         notifyListeners();
@@ -243,7 +288,7 @@ class RcController extends ChangeNotifier with WidgetsBindingObserver {
     unawaited(
       FlutterBluePlus.isScanning.where((bool s) => !s).first.then((_) {
         scanning = false;
-        statusMessage = _results.isEmpty
+        statusMessage = devices.isEmpty
             ? 'No named BLE devices found. Try again.'
             : 'Scan complete.';
         notifyListeners();
@@ -256,6 +301,95 @@ class RcController extends ChangeNotifier with WidgetsBindingObserver {
       await FlutterBluePlus.stopScan();
     } catch (_) {}
     scanning = false;
+    notifyListeners();
+  }
+
+  /// Devices already connected to the phone, plus Android bonded devices.
+  /// A connected peripheral stops advertising, so a scan alone will not see it.
+  Future<void> _loadKnownDevices() async {
+    if (_preview || kIsWeb) return;
+    final List<ScanEntry> system = <ScanEntry>[];
+    try {
+      final List<BluetoothDevice> withService =
+          await FlutterBluePlus.systemDevices(<Guid>[_carServiceGuid]);
+      system.addAll(
+        withService.map(
+          (BluetoothDevice device) =>
+              _entryFromKnown(device, systemConnected: true),
+        ),
+      );
+    } catch (_) {}
+    if (system.isEmpty) {
+      try {
+        final List<BluetoothDevice> any = await FlutterBluePlus.systemDevices(
+          <Guid>[],
+        );
+        system.addAll(
+          any.map(
+            (BluetoothDevice device) =>
+                _entryFromKnown(device, systemConnected: true),
+          ),
+        );
+      } catch (_) {}
+    }
+    final List<ScanEntry> bonded = <ScanEntry>[];
+    if (!kIsWeb && Platform.isAndroid) {
+      try {
+        final List<BluetoothDevice> devices =
+            await FlutterBluePlus.bondedDevices;
+        bonded.addAll(
+          devices.map(
+            (BluetoothDevice device) => _entryFromKnown(device, paired: true),
+          ),
+        );
+      } catch (_) {}
+    }
+    final List<ScanEntry> merged = mergeScanEntries(
+      systemConnected: system,
+      bonded: bonded,
+      scanned: const <ScanEntry>[],
+    );
+    _knownDevices
+      ..clear()
+      ..addEntries(
+        merged.map(
+          (ScanEntry entry) => MapEntry<DeviceIdentifier, ScanEntry>(
+            entry.device.remoteId,
+            entry,
+          ),
+        ),
+      );
+    notifyListeners();
+  }
+
+  ScanEntry _entryFromKnown(
+    BluetoothDevice device, {
+    bool paired = false,
+    bool systemConnected = false,
+  }) {
+    final String name = _deviceName(device, null);
+    final String remoteId = device.remoteId.str;
+    return ScanEntry(
+      device: device,
+      name: name.isEmpty ? remoteId : name,
+      paired: paired,
+      systemConnected: systemConnected,
+    );
+  }
+
+  @visibleForTesting
+  void debugSeedScanEntries(List<ScanEntry> entries) {
+    _scanResults
+      ..clear()
+      ..addEntries(
+        entries.map(
+          (ScanEntry entry) => MapEntry<DeviceIdentifier, ScanEntry>(
+            entry.device.remoteId,
+            entry,
+          ),
+        ),
+      );
+    _knownDevices.clear();
     notifyListeners();
   }
 
@@ -296,15 +430,19 @@ class RcController extends ChangeNotifier with WidgetsBindingObserver {
 
     await _connSub?.cancel();
     try {
+      // Works for a peripheral that is already connected or bonded at the OS
+      // level: connect() attaches this app, then discoverServices() runs below.
       await entry.device.connect(
         license: License.nonprofit,
         timeout: const Duration(seconds: 12),
       );
     } catch (e) {
-      connecting = false;
-      errorMessage = 'Connection failed: $e';
-      notifyListeners();
-      return false;
+      if (!entry.device.isConnected) {
+        connecting = false;
+        errorMessage = 'Connection failed: $e';
+        notifyListeners();
+        return false;
+      }
     }
 
     _connSub = entry.device.connectionState.listen((
@@ -634,6 +772,10 @@ class RcController extends ChangeNotifier with WidgetsBindingObserver {
 
   @override
   void didChangeAppLifecycleState(AppLifecycleState state) {
+    if (state == AppLifecycleState.resumed && !_preview) {
+      unawaited(refreshScanEnvironment());
+      if (!connected) unawaited(_loadKnownDevices());
+    }
     if (state == AppLifecycleState.inactive ||
         state == AppLifecycleState.paused ||
         state == AppLifecycleState.hidden ||

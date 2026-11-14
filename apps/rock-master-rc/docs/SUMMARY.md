@@ -54,7 +54,7 @@ AA 00 02 00 00 00 00 [CTRL] [SPEED] [TYPE]
 
 ## 4. How our app works
 
-1. **Scan:** finds nearby Bluetooth devices and highlights `YC_CAR_DEMO`.
+1. **Scan:** finds nearby Bluetooth devices and highlights `YC_CAR_DEMO`. Also lists devices the phone has already paired or connected, because a connected car stops advertising. On Android 11 and older, a banner asks for Location services when they are off.
 2. **Connect:** finds the service that has one write channel and one reply channel, then subscribes to the replies. The debug inspector also subscribes to every other notify or indicate characteristic.
 3. **Control:** touches set the direction bits. The speed slider and vehicle type fill in the other bytes.
 4. **Send:** a timer sends the message every 100 ms. Letting go, disconnecting, or leaving the app sends stop.
@@ -70,7 +70,7 @@ AA 00 02 00 00 00 00 [CTRL] [SPEED] [TYPE]
 | Bluetooth | `flutter_blue_plus` |
 | Permissions | `permission_handler` |
 | Saved settings | `shared_preferences` |
-| Android build | Signed APK, current version 1.0.3, minimum Android 7 (SDK 24) |
+| Android build | Signed APK, current version 1.0.4, minimum Android 7 (SDK 24) |
 | iOS | Project included; building it needs a Mac with Xcode |
 | Network | None: no internet, accounts, or tracking |
 
@@ -80,6 +80,7 @@ AA 00 02 00 00 00 00 [CTRL] [SPEED] [TYPE]
 - **1.0.1:** joystick and dual-stick control modes
 - **1.0.2:** editable, lockable layouts and named vehicle types (Car, Dump truck, Excavator)
 - **1.0.3:** BLE inspector on the debug screen (full GATT list, battery highlight, read-all, notification log) so we can see whether the car reports a battery
+- **1.0.4:** scan screen lists already paired and connected devices, and on Android 11 and older tells you to turn Location services on
 
 ## 7. Possible next steps
 

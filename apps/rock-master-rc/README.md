@@ -4,13 +4,13 @@ Offline Bluetooth Low Energy controller for the Wonder Toys Rock Master
 (and other LCW_RCcar / TXM-protocol) cars. One Flutter codebase for
 Android and iOS. No accounts, no internet, no tracking.
 
-Package `com.rockmaster.rock_master_rc`, version **1.0.3+4**. The longer
+Package `com.rockmaster.rock_master_rc`, version **1.0.4+5**. The longer
 write-up (how the car's radios work, the command bytes, and version history)
 is in [docs/SUMMARY.md](docs/SUMMARY.md).
 
 ## Features
 
-- Scans for nearby BLE devices and highlights the car (`YC_CAR_DEMO`).
+- Scans for nearby BLE devices and also lists phones that are already paired or connected (a connected car stops advertising). Highlights `YC_CAR_DEMO`. On Android 11 and older, asks you to turn Location services on when they are off, because those Android versions otherwise return an empty scan.
 - Connects, subscribes to replies, and sends a 10-byte command about every 100 ms. Letting go, disconnecting, or leaving the app sends stop.
 - Buttons, joystick, or dual sticks (throttle and steering).
 - Editable layouts: swap sides or reorder the button columns, then lock. The layout is saved per mode.
@@ -109,7 +109,7 @@ It runs on:
 
 - **Actions → Rock Master RC APK → Run workflow.** Choose `release` or `debug`, and whether to also create a GitHub Release.
 - A push to `main` that changes `apps/rock-master-rc/**` or this workflow file. Other apps in the monorepo do not trigger it.
-- A tag whose name matches `rock-master-rc-v*` (for example `rock-master-rc-v1.0.3`). Tag pushes publish a GitHub Release with the APKs attached. GitHub does not apply path filters to tags, so the tag pattern is what keeps other apps' tags from starting this build.
+- A tag whose name matches `rock-master-rc-v*` (for example `rock-master-rc-v1.0.4`). Tag pushes publish a GitHub Release with the APKs attached. GitHub does not apply path filters to tags, so the tag pattern is what keeps other apps' tags from starting this build.
 
 Each run executes `flutter pub get`, `flutter analyze`, and `flutter test`, then builds a universal APK and split-per-ABI APKs. Artifacts are uploaded on the run page, named with the version from `pubspec.yaml`. The job summary lists each APK and its size, and says whether the release keystore was used.
 
