@@ -20,7 +20,7 @@ The Wonder Toys Rock Master is controlled by a small chip that drives two motors
 - **Advertised name:** `YC_CAR_DEMO`
 - **Service:** `0000fff0-0000-1000-8000-00805f9b34fb`
 - **Write characteristic:** `0000fff2-...` (commands go here)
-- **Notify characteristic:** `0000fff1-...` (the car's replies)
+- **Notify characteristic:** `0000fff1-...` (the car's replies). The official app subscribes and ignores the bytes. This app logs them.
 
 ### Command format (10 bytes)
 
@@ -55,12 +55,12 @@ AA 00 02 00 00 00 00 [CTRL] [SPEED] [TYPE]
 ## 4. How our app works
 
 1. **Scan:** finds nearby Bluetooth devices and highlights `YC_CAR_DEMO`.
-2. **Connect:** finds the service that has one write channel and one reply channel, then subscribes to the replies.
+2. **Connect:** finds the service that has one write channel and one reply channel, then subscribes to the replies. The debug inspector also subscribes to every other notify or indicate characteristic.
 3. **Control:** touches set the direction bits. The speed slider and vehicle type fill in the other bytes.
 4. **Send:** a timer sends the message every 100 ms. Letting go, disconnecting, or leaving the app sends stop.
 5. **Control modes:** Buttons, Joystick, or Dual sticks (throttle and steering).
 6. **Editable layouts:** tap Edit layout to swap sides (joystick and dual sticks) or reorder the three columns (buttons), then lock. The layout is saved for each mode.
-7. **Debug panel:** shows the connected IDs, the last message sent, and a switch between writing with and without a reply.
+7. **Debug panel:** shows the connected IDs, the last message sent, and a switch between writing with and without a reply. The BLE inspector under it lists every service and characteristic (UUID and properties), highlights Battery Service `180F` / Battery Level `2A19` and shows the level as a percent, reads every readable value as hex and ASCII, and keeps a timestamped notification log (newest first, capped around 500) with a per-characteristic count and a changed-bytes hint. Copy and Clear sit on that log. None of this changes the 100 ms drive loop or the safety stop.
 
 ## 5. Technology used
 
@@ -70,7 +70,7 @@ AA 00 02 00 00 00 00 [CTRL] [SPEED] [TYPE]
 | Bluetooth | `flutter_blue_plus` |
 | Permissions | `permission_handler` |
 | Saved settings | `shared_preferences` |
-| Android build | Signed APK, current version 1.0.2, minimum Android 7 (SDK 24) |
+| Android build | Signed APK, current version 1.0.3, minimum Android 7 (SDK 24) |
 | iOS | Project included; building it needs a Mac with Xcode |
 | Network | None: no internet, accounts, or tracking |
 
@@ -79,6 +79,7 @@ AA 00 02 00 00 00 00 [CTRL] [SPEED] [TYPE]
 - **1.0.0:** scan, connect, button controls, speed, lights, vehicle type, debug panel
 - **1.0.1:** joystick and dual-stick control modes
 - **1.0.2:** editable, lockable layouts and named vehicle types (Car, Dump truck, Excavator)
+- **1.0.3:** BLE inspector on the debug screen (full GATT list, battery highlight, read-all, notification log) so we can see whether the car reports a battery
 
 ## 7. Possible next steps
 

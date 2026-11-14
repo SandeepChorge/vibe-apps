@@ -4,7 +4,7 @@ Offline Bluetooth Low Energy controller for the Wonder Toys Rock Master
 (and other LCW_RCcar / TXM-protocol) cars. One Flutter codebase for
 Android and iOS. No accounts, no internet, no tracking.
 
-Package `com.rockmaster.rock_master_rc`, version **1.0.2+3**. The longer
+Package `com.rockmaster.rock_master_rc`, version **1.0.3+4**. The longer
 write-up (how the car's radios work, the command bytes, and version history)
 is in [docs/SUMMARY.md](docs/SUMMARY.md).
 
@@ -15,7 +15,7 @@ is in [docs/SUMMARY.md](docs/SUMMARY.md).
 - Buttons, joystick, or dual sticks (throttle and steering).
 - Editable layouts: swap sides or reorder the button columns, then lock. The layout is saved per mode.
 - Speed slider, lights, and vehicle type (Car, Dump truck, Excavator).
-- Debug panel with the connected IDs, the last frame, and write-with-response vs without.
+- Debug panel with the connected IDs, the last frame, write-with-response vs without, and a BLE inspector. The inspector lists every service and characteristic (UUID and read / write / writeNoResp / notify / indicate), highlights Battery Service `180F` and Battery Level `2A19`, reads every readable characteristic, and logs notify/indicate packets without stopping the 100 ms drive loop.
 
 ## Protocol
 
@@ -33,6 +33,14 @@ UUIDs are discovered at runtime: prefer a primary service with exactly one
 notify characteristic and one write characteristic (FFE0/FFF0-style first),
 then fall back to any writable characteristic. See [docs/SUMMARY.md](docs/SUMMARY.md)
 for the service IDs and example frames.
+
+The official app subscribes to `FFF1` and ignores the bytes. This app still
+sends drive frames every 100 ms, and the debug screen's BLE inspector also
+subscribes to every notify/indicate characteristic and keeps a timestamped
+log (newest first, about 500 entries) with a per-characteristic count and a
+changed-bytes hint. Open **Debug** after connecting, then screenshot the
+battery callout, the service list (after **Read all readable**), and the
+notification log.
 
 ## Build locally
 
@@ -101,7 +109,7 @@ It runs on:
 
 - **Actions → Rock Master RC APK → Run workflow.** Choose `release` or `debug`, and whether to also create a GitHub Release.
 - A push to `main` that changes `apps/rock-master-rc/**` or this workflow file. Other apps in the monorepo do not trigger it.
-- A tag whose name matches `rock-master-rc-v*` (for example `rock-master-rc-v1.0.2`). Tag pushes publish a GitHub Release with the APKs attached. GitHub does not apply path filters to tags, so the tag pattern is what keeps other apps' tags from starting this build.
+- A tag whose name matches `rock-master-rc-v*` (for example `rock-master-rc-v1.0.3`). Tag pushes publish a GitHub Release with the APKs attached. GitHub does not apply path filters to tags, so the tag pattern is what keeps other apps' tags from starting this build.
 
 Each run executes `flutter pub get`, `flutter analyze`, and `flutter test`, then builds a universal APK and split-per-ABI APKs. Artifacts are uploaded on the run page, named with the version from `pubspec.yaml`. The job summary lists each APK and its size, and says whether the release keystore was used.
 

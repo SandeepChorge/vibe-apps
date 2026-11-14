@@ -6,6 +6,7 @@ import 'package:flutter/widgets.dart';
 import 'package:flutter_blue_plus/flutter_blue_plus.dart';
 import 'package:permission_handler/permission_handler.dart';
 
+import 'inspector.dart';
 import 'protocol.dart';
 
 const String kSuggestedDeviceName = 'YC_CAR_DEMO';
@@ -21,9 +22,15 @@ class ScanEntry {
 }
 
 class RcController extends ChangeNotifier with WidgetsBindingObserver {
+  /// Drive frames are written on this period. Inspector reads and extra
+  /// subscriptions yield for at least this long so they do not hold the radio.
+  static const Duration commandInterval = Duration(milliseconds: 100);
+
   RcController() {
     WidgetsBinding.instance.addObserver(this);
-    _adapterSub = FlutterBluePlus.adapterState.listen((BluetoothAdapterState s) {
+    _adapterSub = FlutterBluePlus.adapterState.listen((
+      BluetoothAdapterState s,
+    ) {
       adapterState = s;
       notifyListeners();
     });
@@ -44,7 +51,8 @@ class RcController extends ChangeNotifier with WidgetsBindingObserver {
   String? statusMessage;
   String? errorMessage;
 
-  final Map<DeviceIdentifier, ScanEntry> _results = <DeviceIdentifier, ScanEntry>{};
+  final Map<DeviceIdentifier, ScanEntry> _results =
+      <DeviceIdentifier, ScanEntry>{};
   List<ScanEntry> get devices {
     final List<ScanEntry> list = _results.values.toList();
     list.sort((ScanEntry a, ScanEntry b) {
@@ -78,12 +86,24 @@ class RcController extends ChangeNotifier with WidgetsBindingObserver {
 
   bool _preview = false;
 
+  /// GATT table, battery percent, and the notification log. Notifies on its
+  /// own so a packet does not rebuild the drive controls.
+  final BleInspector inspector = BleInspector();
+
   BluetoothCharacteristic? _writeChar;
   Timer? _ticker;
   bool _writeInFlight = false;
   StreamSubscription<List<ScanResult>>? _scanSub;
   StreamSubscription<BluetoothAdapterState>? _adapterSub;
   StreamSubscription<BluetoothConnectionState>? _connSub;
+  final Map<String, StreamSubscription<List<int>>> _packetSubs =
+      <String, StreamSubscription<List<int>>>{};
+  final Set<String> _notifyEnabled = <String>{};
+  final BleReadEchoFilter _readEchoes = BleReadEchoFilter();
+  List<BluetoothCharacteristic> _discoveredChars = <BluetoothCharacteristic>[];
+  bool _readAllInFlight = false;
+  int _inspectSession = 0;
+  Future<void>? _backgroundInspect;
 
   bool get bluetoothOn => adapterState == BluetoothAdapterState.on;
 
@@ -102,39 +122,42 @@ class RcController extends ChangeNotifier with WidgetsBindingObserver {
     errorMessage = null;
     if (kIsWeb) return false;
     try {
-    if (Platform.isAndroid) {
-      final Map<Permission, PermissionStatus> statuses = await <Permission>[
-        Permission.bluetoothScan,
-        Permission.bluetoothConnect,
-        Permission.locationWhenInUse,
-      ].request();
-      final bool scanOk = statuses[Permission.bluetoothScan]?.isGranted != false;
-      final bool connectOk = statuses[Permission.bluetoothConnect]?.isGranted != false;
-      // Location is only required on older Android; if it is denied on API 31+
-      // (not in the active manifest) the request is a no-op / granted.
-      if (!scanOk || !connectOk) {
-        final bool loc = statuses[Permission.locationWhenInUse]?.isGranted ?? false;
-        if (!loc && !scanOk) {
-          errorMessage =
-              'Bluetooth and Location permissions are required to scan on this Android version.';
-          notifyListeners();
-          return false;
-        }
+      if (Platform.isAndroid) {
+        final Map<Permission, PermissionStatus> statuses = await <Permission>[
+          Permission.bluetoothScan,
+          Permission.bluetoothConnect,
+          Permission.locationWhenInUse,
+        ].request();
+        final bool scanOk =
+            statuses[Permission.bluetoothScan]?.isGranted != false;
+        final bool connectOk =
+            statuses[Permission.bluetoothConnect]?.isGranted != false;
+        // Location is only required on older Android; if it is denied on API 31+
+        // (not in the active manifest) the request is a no-op / granted.
         if (!scanOk || !connectOk) {
-          errorMessage = 'Bluetooth permission was denied. Enable it in system settings.';
+          final bool loc =
+              statuses[Permission.locationWhenInUse]?.isGranted ?? false;
+          if (!loc && !scanOk) {
+            errorMessage = 'Bluetooth and Location permissions are required to scan on this Android version.';
+            notifyListeners();
+            return false;
+          }
+          if (!scanOk || !connectOk) {
+            errorMessage = 'Bluetooth permission was denied. Enable it in system settings.';
+            notifyListeners();
+            return false;
+          }
+        }
+      } else if (Platform.isIOS) {
+        final PermissionStatus st = await Permission.bluetooth.request();
+        if (!st.isGranted && !st.isLimited) {
+          errorMessage =
+              'Bluetooth permission was denied. Enable it in Settings.';
           notifyListeners();
           return false;
         }
       }
-    } else if (Platform.isIOS) {
-      final PermissionStatus st = await Permission.bluetooth.request();
-      if (!st.isGranted && !st.isLimited) {
-        errorMessage = 'Bluetooth permission was denied. Enable it in Settings.';
-        notifyListeners();
-        return false;
-      }
-    }
-    return true;
+      return true;
     } catch (e) {
       errorMessage = 'Could not request Bluetooth permissions: $e';
       notifyListeners();
@@ -170,22 +193,25 @@ class RcController extends ChangeNotifier with WidgetsBindingObserver {
     statusMessage = 'Scanning for cars…';
     notifyListeners();
 
-    _scanSub = FlutterBluePlus.onScanResults.listen((List<ScanResult> results) {
-      for (final ScanResult r in results) {
-        final String name = _deviceName(r.device, r.advertisementData);
-        if (name.isEmpty) continue;
-        _results[r.device.remoteId] = ScanEntry(
-          device: r.device,
-          rssi: r.rssi,
-          name: name,
-        );
-      }
-      notifyListeners();
-    }, onError: (Object e) {
-      errorMessage = 'Scan failed: $e';
-      scanning = false;
-      notifyListeners();
-    });
+    _scanSub = FlutterBluePlus.onScanResults.listen(
+      (List<ScanResult> results) {
+        for (final ScanResult r in results) {
+          final String name = _deviceName(r.device, r.advertisementData);
+          if (name.isEmpty) continue;
+          _results[r.device.remoteId] = ScanEntry(
+            device: r.device,
+            rssi: r.rssi,
+            name: name,
+          );
+        }
+        notifyListeners();
+      },
+      onError: (Object e) {
+        errorMessage = 'Scan failed: $e';
+        scanning = false;
+        notifyListeners();
+      },
+    );
 
     try {
       await FlutterBluePlus.startScan(
@@ -214,11 +240,15 @@ class RcController extends ChangeNotifier with WidgetsBindingObserver {
     }
 
     // Mark scanning false when the adapter stops, even if timeout already fired.
-    unawaited(FlutterBluePlus.isScanning.where((bool s) => !s).first.then((_) {
-      scanning = false;
-      statusMessage = _results.isEmpty ? 'No named BLE devices found. Try again.' : 'Scan complete.';
-      notifyListeners();
-    }));
+    unawaited(
+      FlutterBluePlus.isScanning.where((bool s) => !s).first.then((_) {
+        scanning = false;
+        statusMessage = _results.isEmpty
+            ? 'No named BLE devices found. Try again.'
+            : 'Scan complete.';
+        notifyListeners();
+      }),
+    );
   }
 
   Future<void> stopScan() async {
@@ -243,6 +273,12 @@ class RcController extends ChangeNotifier with WidgetsBindingObserver {
 
   Future<bool> connect(ScanEntry entry) async {
     errorMessage = null;
+    _inspectSession++;
+    _cancelPacketSubs();
+    _readEchoes.reset();
+    _discoveredChars = <BluetoothCharacteristic>[];
+    _readAllInFlight = false;
+    inspector.reset();
     await stopScan();
     connecting = true;
     discovering = false;
@@ -260,7 +296,10 @@ class RcController extends ChangeNotifier with WidgetsBindingObserver {
 
     await _connSub?.cancel();
     try {
-      await entry.device.connect(license: License.nonprofit, timeout: const Duration(seconds: 12));
+      await entry.device.connect(
+        license: License.nonprofit,
+        timeout: const Duration(seconds: 12),
+      );
     } catch (e) {
       connecting = false;
       errorMessage = 'Connection failed: $e';
@@ -268,9 +307,13 @@ class RcController extends ChangeNotifier with WidgetsBindingObserver {
       return false;
     }
 
-    _connSub = entry.device.connectionState.listen((BluetoothConnectionState s) {
+    _connSub = entry.device.connectionState.listen((
+      BluetoothConnectionState s,
+    ) {
       final bool now = s == BluetoothConnectionState.connected;
       if (connected && !now) {
+        _inspectSession++;
+        _cancelPacketSubs();
         connected = false;
         connecting = false;
         discovering = false;
@@ -285,30 +328,31 @@ class RcController extends ChangeNotifier with WidgetsBindingObserver {
     notifyListeners();
 
     try {
-      final List<BluetoothService> services = await entry.device.discoverServices();
+      final List<BluetoothService> services = await entry.device
+          .discoverServices();
       final _Endpoints? endpoints = _pickEndpoints(services);
       if (endpoints == null) {
         await entry.device.disconnect();
         connecting = false;
         discovering = false;
-        errorMessage =
-            'No writable BLE characteristic found. You can report the service list from nRF Connect.';
+        errorMessage = 'No writable BLE characteristic found. You can report the service list from nRF Connect.';
         notifyListeners();
         return false;
       }
 
       _writeChar = endpoints.write;
-        serviceUuid = endpoints.service.uuid;
+      serviceUuid = endpoints.service.uuid;
       writeUuid = endpoints.write.characteristicUuid;
       notifyUuid = endpoints.notify?.characteristicUuid;
       usedFallbackDiscovery = endpoints.fallback;
       discoveryNotes = endpoints.notes;
+      _publishServices(services);
 
       if (endpoints.notify != null) {
-        try {
-          await endpoints.notify!.setNotifyValue(true);
-        } catch (e) {
-          discoveryNotes = '${discoveryNotes.isEmpty ? '' : '$discoveryNotes; '}notify subscribe failed: $e';
+        final String? notifyError = await _ensureNotify(endpoints.notify!);
+        if (notifyError != null) {
+          discoveryNotes =
+              '${discoveryNotes.isEmpty ? '' : '$discoveryNotes; '}notify subscribe failed: $notifyError';
         }
       }
 
@@ -320,6 +364,8 @@ class RcController extends ChangeNotifier with WidgetsBindingObserver {
       statusMessage = 'Connected to ${entry.name}';
       _startTicker();
       notifyListeners();
+      final int session = _inspectSession;
+      _backgroundInspect = _inspectRest(services, session);
       return true;
     } catch (e) {
       connecting = false;
@@ -334,10 +380,15 @@ class RcController extends ChangeNotifier with WidgetsBindingObserver {
   }
 
   Future<void> disconnect({bool sendStopFirst = true}) async {
+    _inspectSession++;
     _stopTicker();
+    _cancelPacketSubs();
     if (sendStopFirst && connected) {
       forward = back = left = right = false;
-      await _writeFrame(RcProtocol.stop(light: light, speed: speed, flag: flag), force: true);
+      await _writeFrame(
+        RcProtocol.stop(light: light, speed: speed, flag: flag),
+        force: true,
+      );
     }
     try {
       await device?.disconnect();
@@ -445,7 +496,7 @@ class RcController extends ChangeNotifier with WidgetsBindingObserver {
 
   void _startTicker() {
     _ticker?.cancel();
-    _ticker = Timer.periodic(const Duration(milliseconds: 100), (_) {
+    _ticker = Timer.periodic(commandInterval, (_) {
       unawaited(_writeFrame(currentFrame()));
     });
     unawaited(_writeFrame(currentFrame()));
@@ -497,7 +548,10 @@ class RcController extends ChangeNotifier with WidgetsBindingObserver {
 
   static bool isPreferredService(Guid uuid) {
     final String s = uuid.str128.toLowerCase();
-    return s.contains('0000ffe0-') || s.contains('0000fff0-') || uuid.str.toLowerCase() == 'ffe0' || uuid.str.toLowerCase() == 'fff0';
+    return s.contains('0000ffe0-') ||
+        s.contains('0000fff0-') ||
+        uuid.str.toLowerCase() == 'ffe0' ||
+        uuid.str.toLowerCase() == 'fff0';
   }
 
   static bool _isWritable(BluetoothCharacteristic c) =>
@@ -518,14 +572,18 @@ class RcController extends ChangeNotifier with WidgetsBindingObserver {
         if (_isNotifiable(c) && notify == null) notify = c;
       }
       if (write != null && notify != null) {
-        exact.add(_Endpoints(
-          service: svc,
-          write: write,
-          notify: notify,
-          fallback: false,
-          notes: 'Matched primary service with notify + write '
-              '${isPreferredService(svc.uuid) ? '(preferred FFE0/FFF0 style)' : ''}'.trim(),
-        ));
+        exact.add(
+          _Endpoints(
+            service: svc,
+            write: write,
+            notify: notify,
+            fallback: false,
+            notes:
+                'Matched primary service with notify + write '
+                        '${isPreferredService(svc.uuid) ? '(preferred FFE0/FFF0 style)' : ''}'
+                    .trim(),
+          ),
+        );
       }
     }
     if (exact.isNotEmpty) {
@@ -547,14 +605,17 @@ class RcController extends ChangeNotifier with WidgetsBindingObserver {
         if (_isNotifiable(c) && notify == null) notify = c;
       }
       if (write == null) continue;
-      fallbacks.add(_Endpoints(
-        service: svc,
-        write: write,
-        notify: notify,
-        fallback: true,
-        notes: 'Fallback: first writable characteristic '
-            '${isPreferredService(svc.uuid) ? '(preferred FFE0/FFF0 style service)' : 'on ${svc.uuid.str128}'}',
-      ));
+      fallbacks.add(
+        _Endpoints(
+          service: svc,
+          write: write,
+          notify: notify,
+          fallback: true,
+          notes:
+              'Fallback: first writable characteristic '
+              '${isPreferredService(svc.uuid) ? '(preferred FFE0/FFF0 style service)' : 'on ${svc.uuid.str128}'}',
+        ),
+      );
     }
     if (fallbacks.isEmpty) return null;
     fallbacks.sort((a, b) {
@@ -565,6 +626,7 @@ class RcController extends ChangeNotifier with WidgetsBindingObserver {
         if (e.notify != null) s -= 2;
         return s;
       }
+
       return score(a).compareTo(score(b));
     });
     return fallbacks.first;
@@ -578,23 +640,293 @@ class RcController extends ChangeNotifier with WidgetsBindingObserver {
         state == AppLifecycleState.detached) {
       if (connected) {
         forward = back = left = right = false;
-        unawaited(_writeFrame(RcProtocol.stop(light: light, speed: speed, flag: flag), force: true));
+        unawaited(
+          _writeFrame(
+            RcProtocol.stop(light: light, speed: speed, flag: flag),
+            force: true,
+          ),
+        );
       }
+    }
+  }
+
+  // ---------------------------------------------------------------------------
+  // BLE inspector (reads and extra subscriptions). Drive writes do not call this.
+  // ---------------------------------------------------------------------------
+
+  Future<void> readAllReadable() async {
+    if (_preview) {
+      inspector.setStatus('Connect to the car to read characteristics.');
+      return;
+    }
+    if (!connected) {
+      inspector.setStatus('Not connected.');
+      return;
+    }
+    if (_readAllInFlight) return;
+    final Future<void>? pending = _backgroundInspect;
+    if (pending != null) {
+      inspector.setReading(true);
+      inspector.setStatus('Waiting for the connection reads to finish…');
+      try {
+        await pending;
+      } catch (_) {}
+    }
+    if (!connected || _preview) {
+      inspector.setReading(false);
+      return;
+    }
+    final List<BluetoothCharacteristic> targets = _discoveredChars
+        .where((BluetoothCharacteristic c) => c.properties.read)
+        .toList();
+    if (targets.isEmpty) {
+      inspector.setReading(false);
+      inspector.setStatus('No readable characteristics.');
+      return;
+    }
+    _readAllInFlight = true;
+    final int session = _inspectSession;
+    inspector.setReading(true);
+    int ok = 0;
+    int failed = 0;
+    for (int i = 0; i < targets.length; i++) {
+      if (session != _inspectSession || !connected) break;
+      final BluetoothCharacteristic characteristic = targets[i];
+      inspector.setStatus('Reading ${i + 1} of ${targets.length}…');
+      try {
+        final List<int> value = await _readForInspector(
+          characteristic,
+          session,
+        );
+        if (session != _inspectSession) break;
+        inspector.applyRead(_charKey(characteristic), value);
+        ok += 1;
+      } catch (e) {
+        if (session != _inspectSession) break;
+        inspector.applyReadError(_charKey(characteristic), '$e');
+        failed += 1;
+      }
+      if (i != targets.length - 1 && session == _inspectSession && connected) {
+        await Future<void>.delayed(kInspectorGattGap);
+      }
+    }
+    _readAllInFlight = false;
+    if (session != _inspectSession) return;
+    inspector.setReading(false);
+    inspector.setStatus(
+      'Read $ok characteristic${ok == 1 ? '' : 's'}'
+      '${failed == 0 ? '' : ', $failed failed'}.',
+    );
+  }
+
+  void _publishServices(List<BluetoothService> services) {
+    _discoveredChars = <BluetoothCharacteristic>[
+      for (final BluetoothService service in services)
+        ...service.characteristics,
+    ];
+    inspector.setServices(<BleServiceView>[
+      for (final BluetoothService service in services)
+        BleServiceView(
+          uuid: service.uuid.str128,
+          primary: service.isPrimary,
+          characteristics: <BleCharView>[
+            for (final BluetoothCharacteristic characteristic
+                in service.characteristics)
+              BleCharView(
+                key: _charKey(characteristic),
+                serviceUuid: service.uuid.str128,
+                uuid: characteristic.characteristicUuid.str128,
+                instanceId: characteristic.instanceId,
+                properties: BleCharProperties(
+                  read: characteristic.properties.read,
+                  write: characteristic.properties.write,
+                  writeNoResp: characteristic.properties.writeWithoutResponse,
+                  notify: characteristic.properties.notify,
+                  indicate: characteristic.properties.indicate,
+                ),
+              ),
+          ],
+        ),
+    ]);
+  }
+
+  String _charKey(BluetoothCharacteristic characteristic) {
+    return bleCharKey(
+      serviceUuid: characteristic.serviceUuid.str128,
+      characteristicUuid: characteristic.characteristicUuid.str128,
+      instanceId: characteristic.instanceId,
+    );
+  }
+
+  /// Subscribe to notify/indicate characteristics other than the drive one,
+  /// then read Battery Level when it is readable. Yields between GATT ops so
+  /// [_writeFrame] can keep the 100 ms cadence.
+  Future<void> _inspectRest(
+    List<BluetoothService> services,
+    int session,
+  ) async {
+    for (final BluetoothService service in services) {
+      for (final BluetoothCharacteristic characteristic
+          in service.characteristics) {
+        if (!characteristic.properties.notify &&
+            !characteristic.properties.indicate) {
+          continue;
+        }
+        if (session != _inspectSession || !connected) return;
+        await _ensureNotify(characteristic, timeout: 2);
+        if (session != _inspectSession || !connected) return;
+        await Future<void>.delayed(kInspectorGattGap);
+      }
+    }
+    if (session != _inspectSession || !connected) return;
+    await _readBattery(session);
+  }
+
+  Future<void> _readBattery(int session) async {
+    BluetoothCharacteristic? battery;
+    for (final BluetoothCharacteristic characteristic in _discoveredChars) {
+      if (isBatteryLevelUuid(characteristic.characteristicUuid.str128) &&
+          characteristic.properties.read) {
+        battery = characteristic;
+        break;
+      }
+    }
+    if (battery == null || session != _inspectSession || !connected) return;
+    try {
+      final List<int> value = await _readForInspector(battery, session);
+      if (session != _inspectSession) return;
+      inspector.applyRead(_charKey(battery), value);
+    } catch (e) {
+      if (session != _inspectSession) return;
+      inspector.applyReadError(_charKey(battery), '$e');
+    }
+  }
+
+  /// Returns an error string when enabling notifications fails.
+  /// The drive characteristic uses the default timeout so connect behavior
+  /// matches the previous single subscribe.
+  Future<String?> _ensureNotify(
+    BluetoothCharacteristic characteristic, {
+    int timeout = 15,
+  }) async {
+    final String key = _charKey(characteristic);
+    if (!_packetSubs.containsKey(key)) {
+      final int session = _inspectSession;
+      final StreamSubscription<List<int>> sub = characteristic.onValueReceived
+          .listen(
+            (List<int> value) {
+              if (session != _inspectSession) return;
+              _onIncoming(characteristic, value);
+            },
+            onError: (Object error) {
+              if (session != _inspectSession) return;
+              inspector.setSubscribeError(key, 'notification error: $error');
+            },
+          );
+      _packetSubs[key] = sub;
+      characteristic.device.cancelWhenDisconnected(sub);
+    }
+    if (_notifyEnabled.contains(key) || characteristic.isNotifying) {
+      _notifyEnabled.add(key);
+      inspector.markSubscribed(key);
+      return null;
+    }
+    try {
+      final bool indicateOnly =
+          !kIsWeb &&
+          Platform.isAndroid &&
+          characteristic.properties.indicate &&
+          !characteristic.properties.notify;
+      await characteristic.setNotifyValue(
+        true,
+        timeout: timeout,
+        forceIndications: indicateOnly,
+      );
+      _notifyEnabled.add(key);
+      inspector.markSubscribed(key);
+      return null;
+    } catch (e) {
+      inspector.setSubscribeError(key, '$e');
+      return '$e';
+    }
+  }
+
+  void _onIncoming(BluetoothCharacteristic characteristic, List<int> value) {
+    final String key = _charKey(characteristic);
+    final List<List<int>> packets = _readEchoes.onValue(key, value);
+    for (final List<int> packet in packets) {
+      inspector.recordPacket(
+        key: key,
+        characteristicUuid: characteristic.characteristicUuid.str128,
+        bytes: packet,
+      );
+    }
+  }
+
+  Future<List<int>> _readForInspector(
+    BluetoothCharacteristic characteristic,
+    int session,
+  ) async {
+    final String key = _charKey(characteristic);
+    _readEchoes.begin(key);
+    try {
+      final List<int> value = await characteristic.read(timeout: 2);
+      final List<List<int>> extra = _readEchoes.finish(key, value);
+      if (session == _inspectSession) {
+        for (final List<int> packet in extra) {
+          inspector.recordPacket(
+            key: key,
+            characteristicUuid: characteristic.characteristicUuid.str128,
+            bytes: packet,
+          );
+        }
+        unawaited(
+          Future<void>.delayed(const Duration(milliseconds: 300), () {
+            if (session == _inspectSession) _readEchoes.expireEcho(key);
+          }),
+        );
+      }
+      return value;
+    } catch (e) {
+      final List<List<int>> extra = _readEchoes.fail(key);
+      if (session == _inspectSession) {
+        for (final List<int> packet in extra) {
+          inspector.recordPacket(
+            key: key,
+            characteristicUuid: characteristic.characteristicUuid.str128,
+            bytes: packet,
+          );
+        }
+      }
+      rethrow;
+    }
+  }
+
+  void _cancelPacketSubs() {
+    final List<StreamSubscription<List<int>>> subs = _packetSubs.values
+        .toList();
+    _packetSubs.clear();
+    _notifyEnabled.clear();
+    for (final StreamSubscription<List<int>> sub in subs) {
+      unawaited(sub.cancel());
     }
   }
 
   @override
   void dispose() {
+    _inspectSession++;
     if (!_preview) {
       WidgetsBinding.instance.removeObserver(this);
     }
     _stopTicker();
+    _cancelPacketSubs();
     _scanSub?.cancel();
     _adapterSub?.cancel();
     _connSub?.cancel();
     if (connected && !_preview) {
       unawaited(disconnect(sendStopFirst: true));
     }
+    inspector.dispose();
     super.dispose();
   }
 }
