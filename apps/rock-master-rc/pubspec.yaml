@@ -1,7 +1,7 @@
 name: rock_master_rc
 description: Offline BLE controller for the Wonder Toys Rock Master RC crawler.
 publish_to: "none"
-version: 1.0.2+3
+version: 1.0.4+5
 
 environment:
   sdk: ^3.14.0

@@ -312,6 +312,7 @@ class _ControlScreenState extends State<ControlScreen> {
           child: ConstrainedBox(
             constraints: BoxConstraints(maxHeight: h * 0.85),
             child: SingleChildScrollView(
+              key: const Key('debug-sheet-scroll'),
               padding: const EdgeInsets.fromLTRB(12, 0, 12, 16),
               child: DebugPanel(controller: widget.controller),
             ),
